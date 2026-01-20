@@ -14,7 +14,8 @@ def tpu_strategy():
     topology = tf.tpu.experimental.initialize_tpu_system(resolver)
     print(f"topology.num_tpus_per_task: {topology.num_tpus_per_task}")
     print(f"topology.missing_devices: {topology.missing_devices}")
-    strategy = tf.distribute.TPUStrategy(resolver)
+    device_assignment = tf.tpu.experimental.DeviceAssignment.build(topology, num_replicas=topology.num_tpus_per_task)
+    strategy = tf.distribute.TPUStrategy(resolver, experimental_device_assignment=device_assignment)
     return strategy
 
 distribute_test(tpu_strategy())
