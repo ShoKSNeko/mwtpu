@@ -18,11 +18,11 @@ def mnist_train_dataset():
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     return dataset
 
-def train_mnist(strategy, savepath):
+def train_mnist(strategy, saveprefix):
     dataset = mnist_train_dataset()
     model = twolayer.compiled_model(strategy)
     model.fit(dataset, epochs=10)
-    model.save(savepath)
+    model.save_weights(f"{saveprefix}.weights.h5")
 
 def tpu_strategy():
     resolver = tf.distribute.cluster_resolver.TPUClusterResolver('local')
