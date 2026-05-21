@@ -24,4 +24,7 @@ class CustomStepModel(tf.keras.Model):
         reduce_args = tape.gradient(loss, self.trainable_variables),
         reduced_grads = tf.distribute.get_replica_context().merge_call(self._reduce_gradients, args=reduce_args)
         self.optimizer.apply_gradients(zip(reduced_grads, self.trainable_variables))
-        return self.compute_metrics(x, y, y_pred, sample_weight)
+        for metric in self.metrics:
+            if metric.name == "loss": metric.update_state(loss)
+            else: metric.update_state(y, y_pred)
+        return {metric.name: metric.result() for metric in self.metrics}
