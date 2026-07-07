@@ -1,4 +1,7 @@
 """ custom training loop の見本 """
+# https://www.tensorflow.org/tutorials/distribute/custom_training
+# https://www.tensorflow.org/guide/distributed_training
+# https://www.tensorflow.org/guide/tpu#train_the_model_using_a_custom_training_loop
 from os import environ
 import libtpu
 environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
@@ -12,24 +15,31 @@ train_epochs = 3
 
 class CustomTrainLoopModel(tf.keras.Model):
     def __init__(self, global_batch_size, *args, **kwargs):
-        self.global_batch_size = global_batch_size
         super().__init__(*args, **kwargs)
+        self.global_batch_size = global_batch_size
+        self.cumul_loss = self.add_variable((), tf.keras.initializers.Zeros(), tf.float32, trainable=False)
+        self.cumul_accu = self.add_variable((), tf.keras.initializers.Zeros(), tf.float32, trainable=False)
 
-    def train_step(self, data):
-        x, y, sample_weight = tf.keras.utils.unpack_x_y_sample_weight(data)
+    def get_grads_and_metrics(self, data):
+        x, y = data
         with tf.GradientTape() as tape:
             y_pred = self(x, training=True)
-            per_example_loss = self.compute_loss(x, y, y_pred, sample_weight)
+            per_example_loss = self.compute_loss(x, y, y_pred)
             loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.global_batch_size)
         gradients = tape.gradient(loss, self.trainable_variables)
+        accuracy = tf.reduce_sum(tf.keras.metrics.sparse_categorical_accuracy(y, y_pred))
+        return gradients, loss, accuracy
+
+    def app_grads(self, gradients):
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        for metric in self.metrics:
-            if metric.name == 'loss': metric.update_state(per_example_loss)
-            else: metric.update_state(y, y_pred, sample_weight)
 
     @tf.function
     def dist_train_step(self, data):
-        self.distribute_strategy.run(self.train_step, (data,))
+        grads_and_metrics = self.distribute_strategy.run(self.get_grads_and_metrics, (data,))
+        gradients, loss, accuracy = self.distribute_strategy.reduce('SUM', grads_and_metrics, None)
+        self.distribute_strategy.run(self.app_grads, (gradients,))
+        self.cumul_loss.assign_add(loss)
+        self.cumul_accu.assign_add(accuracy)
 
     def custom_train(self, dataset, steps_per_epoch, epochs):
         dist_dataset = self.distribute_strategy.experimental_distribute_dataset(dataset)
@@ -37,9 +47,12 @@ class CustomTrainLoopModel(tf.keras.Model):
             self.dist_train_step(batch)
             if step % steps_per_epoch == 0:
                 epoch = step // steps_per_epoch
-                print(f"Epoch {epoch}:", ", ".join(f"{key} = {val:g}" for key, val in self.get_metrics_result().items()))
+                avg_loss = self.cumul_loss / steps_per_epoch
+                avg_accu = self.cumul_accu / (steps_per_epoch * self.global_batch_size)
+                print(f"Epoch {epoch}: loss = {avg_loss:g}, accuracy = {avg_accu:g}")
                 if epoch == epochs: break
-                self.reset_metrics()
+                self.cumul_loss.assign(0.)
+                self.cumul_accu.assign(0.)
 
 def get_dataset(global_batch_size):
     (x_train, y_train), test = tf.keras.datasets.mnist.load_data()
@@ -68,8 +81,7 @@ def create_compiled_model(strategy, global_batch_size):
         model = TwolayerModel(global_batch_size)
         optimizer = tf.keras.optimizers.Adam()
         loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
-        accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='accuracy')
-        model.compile(optimizer=optimizer, loss=loss, metrics=[accuracy])
+        model.compile(optimizer=optimizer, loss=loss)
     return model
 
 def tpu_strategy():
@@ -84,7 +96,6 @@ def run(train_epochs):
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
     steps_per_epoch, dataset = get_dataset(global_batch_size)
     model = create_compiled_model(strategy, global_batch_size)
-    #model.test_on_batch(*map(lambda spec: tf.zeros((1, *spec.shape.as_list()[1:]), spec.dtype), dataset.element_spec))
     model.custom_train(dataset, steps_per_epoch, train_epochs)
 
 if __name__ == '__main__':
