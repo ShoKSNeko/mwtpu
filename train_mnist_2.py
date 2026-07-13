@@ -1,5 +1,5 @@
 """ 単一ワーカでのトレーニング """
-""" カスタマイズした train_step """
+""" カスタムトレーニングループ """
 from sys import argv
 from os import environ
 import libtpu
@@ -11,20 +11,21 @@ import tensorflow as tf
 
 import twolayer_model_1 as twolayer
 
-batch_size = 32
+per_replica_batch_size = 8
 
-def mnist_train_dataset():
+def mnist_train_dataset(global_batch_size):
     (x_train, y_train), test = tf.keras.datasets.mnist.load_data()
     dataset = tf.data.Dataset.from_tensor_slices((x_train / 255., y_train))
-    dataset = dataset.shuffle(dataset.cardinality())
-    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.shuffle(dataset.cardinality()).repeat()
+    dataset = dataset.batch(global_batch_size, drop_remainder=True)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    return dataset
+    return x_train.shape[0] // global_batch_size, dataset
 
-def train_mnist(strategy, global_batch_size, saveprefix):
-    dataset = mnist_train_dataset()
+def train_mnist(strategy, saveprefix):
+    global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
+    steps_per_epoch, dataset = mnist_train_dataset(global_batch_size)
     model = twolayer.compiled_model(strategy, global_batch_size)
-    model.fit(dataset, epochs=10)
+    model.custom_train(dataset, steps_per_epoch, 10)
     model.save_weights(f"{saveprefix}.weights.h5")
 
 def tpu_strategy():
@@ -36,4 +37,4 @@ def tpu_strategy():
     return strategy
 
 if __name__ == "__main__":
-    train_mnist(tpu_strategy(), batch_size, *argv[1:])
+    train_mnist(tpu_strategy(), *argv[1:])

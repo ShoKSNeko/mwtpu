@@ -1,11 +1,11 @@
 """ 2層パーセプトロン """
-""" train_step をカスタム """
+""" 単一ワーカでカスタムトレーニング """
 
 import tensorflow as tf
 
-from custom_step import CustomStepModel
+from custom_loop import CustomTrainLoopModel
 
-class TwolayerModel(CustomStepModel):
+class TwolayerModel(CustomTrainLoopModel):
     def __init__(self, global_batch_size):
         super().__init__(global_batch_size)
         self.flatten = tf.keras.layers.Flatten()
@@ -24,5 +24,5 @@ def compiled_model(strategy, global_batch_size):
         model = TwolayerModel(global_batch_size)
         optimizer = tf.keras.optimizers.Adam()
         loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
-        model.compile(optimizer=optimizer, loss=loss, metrics=['accuracy'])
+        model.compile(optimizer=optimizer, loss=loss)
     return model
