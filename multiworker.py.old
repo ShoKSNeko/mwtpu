@@ -1,0 +1,108 @@
+""" keras.Model のマルチワーカ対応サブクラス """
+
+from time import sleep
+
+from portpicker import pick_unused_port
+
+import tensorflow as tf
+
+class MultiworkerModel(tf.keras.Model):
+    def __init__(self, grpc_address_file, hostname, workernum, worker_id, global_batch_size, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grpc_address_file = grpc_address_file
+        self.hostname = hostname
+        self.workernum = workernum
+        self.worker_id = worker_id
+        self.global_batch_size = global_batch_size
+
+    def _get_params(self, worker_id):
+        q = self.param_qs[worker_id - 1]
+        @tf.function(input_signature=[])
+        def f(): return q.dequeue()
+        return f
+
+    def _put_grads(self, signature):
+        q = self.grads_q
+        @tf.function(input_signature=signature)
+        def f(*args):
+            q.enqueue(args)
+            return ()
+        return f
+
+    def _clnt_getp(self):
+        method = getattr(self.rpcclient, f"get_params{self.worker_id}")
+        def f(): return method([]).get_value()
+        return f
+
+    def _clnt_putg(self):
+        method = getattr(self.rpcclient, "put_grads")
+        def f(grads): method(*grads).is_ok()
+        return f
+
+    # build() されたあと train_step が呼ばれる前にここを通る
+    def make_train_function(self, force=False):
+        if self.train_function is None:
+            if self.worker_id == 0:
+                varspecs = [(v.dtype, v.shape) for v in self.trainable_variables]
+                self.param_qs = [tf.queue.FIFOQueue(1, *zip(*varspecs)) for _ in range(self.workernum - 1)]
+                self.grads_q = tf.queue.FIFOQueue(self.workernum - 1, *zip(*varspecs))
+                grpc_address = f"{self.hostname}:{pick_unused_port()}"
+                self.rpcserver = tf.distribute.experimental.rpc.Server.create('grpc', grpc_address)
+                for w in range(1, self.workernum):
+                    self.rpcserver.register(f"get_params{w}", self._get_params(w))
+                self.rpcserver.register("put_grads", self._put_grads([tf.TensorSpec(shape, dtype) for dtype, shape in varspecs]))
+                self.rpcserver.start()
+                with tf.io.gfile.GFile(f"{self.grpc_address_file}.s", 'w') as f: f.write(grpc_address)
+                tf.io.gfile.rename(f"{self.grpc_address_file}.s", self.grpc_address_file)
+            else:
+                while not tf.io.gfile.exists(self.grpc_address_file): sleep(.1)
+                with tf.io.gfile.GFile(self.grpc_address_file) as f: grpc_address = f.read()
+                self.rpcclient = tf.distribute.experimental.rpc.Client.create('grpc', grpc_address)
+                self.get_params = self._clnt_getp()
+                self.put_grads = self._clnt_putg()
+        super().make_train_function(force)
+
+    def _synchronize_params(self, strategy, vars):
+        if self.worker_id == 0:
+            for q in self.param_qs:
+                q.enqueue(vars)
+        else:
+            for v, val in zip(vars, self.get_params()):
+                v.assign(val)
+
+    def _reduce_gradients(self, strategy, grads):
+        reduced_grads = [strategy.reduce(tf.distribute.ReduceOp.SUM, g, None) for g in grads]
+        if self.worker_id != 0:
+            self.put_grads(reduced_grads)
+        else:
+            collected_grads = self.grads_q.dequeue_many(self.workernum - 1)
+            reduced_grads = [r + tf.reduce_sum(c, 0) for r, c in zip(reduced_grads, collected_grads)]
+        return reduced_grads
+
+    def train_step(self, data):
+        tf.distribute.get_replica_context().merge_call(self._synchronize_params, args=(self.trainable_variables,))
+        x, y, sample_weight = tf.keras.utils.unpack_x_y_sample_weight(data)
+        with tf.GradientTape() as tape:
+            y_pred = self(x, training=True)
+            # loss は reduction=keras.losses.Reduction.NONE としてコンパイルする
+            # 分散トレーニングでは global_batch_size が各ワーカのデータ数と異なる
+            per_example_loss = self.compute_loss(x, y, y_pred, sample_weight)
+            loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=self.global_batch_size)
+        # 分散トレーニングではワーカ0に勾配の総和を送信するのでオプティマイザに任せず自分で集計する
+        # apply_gradients の中でも勾配を all_reduce しているが、既に merge_call の結果なので値は変わらない
+        reduce_args = tape.gradient(loss, self.trainable_variables),
+        reduced_grads = tf.distribute.get_replica_context().merge_call(self._reduce_gradients, args=reduce_args)
+        self.optimizer.apply_gradients(zip(reduced_grads, self.trainable_variables))
+        for metric in self.metrics:
+            if metric.name == "loss": metric.update_state(loss)
+            else: metric.update_state(y, y_pred)
+        return {metric.name: metric.result() for metric in self.metrics}
+
+    # ワーカ0でセーブが完了するまで他のワーカを生かしておく
+    def synchronize_finish(self):
+        if self.worker_id == 0:
+            tf.io.gfile.remove(self.grpc_address_file)
+            for q in self.param_qs:
+                q.enqueue(self.trainable_variables)
+        else:
+            self.get_params()

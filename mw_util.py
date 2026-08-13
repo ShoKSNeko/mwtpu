@@ -22,3 +22,6 @@ def my_worker_id():
 
 def num_workers():
     return len(get_metadata("instance/attributes/worker-network-endpoints").split(','))
+
+def my_hostname():
+    return get_metadata("instance/guest-attributes/deviceInfo/hostname")

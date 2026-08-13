@@ -56,7 +56,7 @@ def main(argv):
         if stat != "ACTIVE": raise RuntimeError(f"unexpected queued resource state: {stat}")
         run_command(*qrssh("sudo pip3 install --progress-bar off --upgrade pip"))
         pip_install = "sudo pip3 install --progress-bar off --root-user-action ignore"
-        run_command(*qrssh(f"{pip_install} tensorflow-tpu{FLAGS.tfversion}"))
+        run_command(*qrssh(f"{pip_install} tensorflow-tpu{FLAGS.tfversion} portpicker"))
         if FLAGS.scpfile: run_command(*qrscp(FLAGS.scpfile))
         run_command(*qrssh(FLAGS.runcmd))
     finally:

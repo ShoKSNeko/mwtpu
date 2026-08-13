@@ -20,7 +20,7 @@ class CustomTrainLoopModel(tf.keras.Model):
         gradients = tape.gradient(loss, self.trainable_variables)
         accuracy = tf.reduce_sum(tf.keras.metrics.sparse_categorical_accuracy(y, y_pred))
         # 分散トレーニングではワーカ0に勾配の総和を送信するのでここでレプリカ毎の値を集計する
-        return tf.distribute.get_replica_context().all_reduce(tf.distribute.ReduceOp.SUM, (gradients, loss, accuracy))
+        return tf.distribute.get_replica_context().all_reduce(tf.distribute.ReduceOp.SUM, (*gradients, loss, accuracy))
 
     def app_grads(self, gradients):
         # apply_gradients は勾配を all_reduce するが、もともとreduceされた値なので影響はない
@@ -29,9 +29,8 @@ class CustomTrainLoopModel(tf.keras.Model):
     @tf.function
     def dist_train_step(self, data):
         grads_and_metrics = self.distribute_strategy.run(self.get_grads_and_metrics, (data,))
-        gradients, *metrics = self.distribute_strategy.experimental_local_results(grads_and_metrics)[0]
-        self.distribute_strategy.run(self.app_grads, (gradients,))
-        return metrics
+        self.distribute_strategy.run(self.app_grads, (grads_and_metrics[:-2],))
+        return self.distribute_strategy.experimental_local_results(grads_and_metrics[-2:])[0]
 
     def custom_train(self, dataset, steps_per_epoch, epochs):
         dist_dataset = self.distribute_strategy.experimental_distribute_dataset(dataset)
